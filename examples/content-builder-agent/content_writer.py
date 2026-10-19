@@ -17,6 +17,7 @@ Usage:
 """
 
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -38,6 +39,20 @@ from deepagents.backends import FilesystemBackend
 EXAMPLE_DIR = Path(__file__).parent
 console = Console()
 
+# Logging: write structured logs to stderr so they don't compete with the rich
+# Console output on stdout. Level can be overridden with the
+# CONTENT_WRITER_LOG_LEVEL environment variable (default: INFO).
+logger = logging.getLogger("content_writer")
+if not logger.handlers:
+    _log_level_name = os.environ.get("CONTENT_WRITER_LOG_LEVEL", "INFO").upper()
+    _log_level = getattr(logging, _log_level_name, logging.INFO)
+    logging.basicConfig(
+        level=_log_level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+logger.debug("Logger initialised at level %s", _log_level_name)
+
 
 # Web search tool for the researcher subagent
 @tool
@@ -56,16 +71,33 @@ def web_search(
     Returns:
         Search results with titles, URLs, and content excerpts.
     """
+    logger.debug(
+        "web_search called: query=%r, max_results=%d, topic=%s",
+        query,
+        max_results,
+        topic,
+    )
     try:
         from tavily import TavilyClient
 
         api_key = os.environ.get("TAVILY_API_KEY")
         if not api_key:
+            logger.warning("web_search: TAVILY_API_KEY not set in environment")
             return {"error": "TAVILY_API_KEY not set"}
 
         client = TavilyClient(api_key=api_key)
-        return client.search(query, max_results=max_results, topic=topic)
+        logger.info("web_search: querying Tavily (query=%r)", query)
+        result = client.search(query, max_results=max_results, topic=topic)
+        # Tavily returns a dict that may include a 'results' list.
+        results_count = (
+            len(result.get("results"))
+            if isinstance(result, dict) and isinstance(result.get("results"), list)
+            else "n/a"
+        )
+        logger.info("web_search: completed (query=%r, results=%s)", query, results_count)
+        return result
     except Exception as e:
+        logger.exception("web_search failed for query=%r: %s", query, e)
         return {"error": f"Search failed: {e}"}
 
 
@@ -93,10 +125,22 @@ def _generate_image_with_qwen(prompt: str, output_path: Path, size: str) -> str:
 
     from dashscope import MultiModalConversation
 
+    logger.debug(
+        "_generate_image_with_qwen: prompt=%r, size=%s, output=%s",
+        prompt,
+        size,
+        output_path,
+    )
     if not os.environ.get("DASHSCOPE_API_KEY"):
+        logger.warning("_generate_image_with_qwen: DASHSCOPE_API_KEY not set")
         return "Error: DASHSCOPE_API_KEY not set"
 
     try:
+        logger.info(
+            "Calling DashScope MultiModalConversation (model=%s, size=%s)",
+            QWEN_IMAGE_MODEL,
+            size,
+        )
         rsp = MultiModalConversation.call(
             model=QWEN_IMAGE_MODEL,
             messages=[{"role": "user", "content": [{"text": prompt}]}],
@@ -105,12 +149,19 @@ def _generate_image_with_qwen(prompt: str, output_path: Path, size: str) -> str:
             size=size,
         )
     except Exception as e:
+        logger.exception("_generate_image_with_qwen: DashScope call failed: %s", e)
         return f"Error: {e}"
 
     if rsp.status_code != HTTPStatus.OK:
         msg = (
             f"Error: Qwen image generation failed "
             f"(status={rsp.status_code}, code={rsp.code}, message={rsp.message})"
+        )
+        logger.error(
+            "Qwen image generation failed: status=%s code=%s message=%s",
+            rsp.status_code,
+            getattr(rsp, "code", None),
+            getattr(rsp, "message", None),
         )
         return msg
 
@@ -124,13 +175,18 @@ def _generate_image_with_qwen(prompt: str, output_path: Path, size: str) -> str:
         if image_url:
             break
     if not image_url:
+        logger.warning("Qwen returned no image url in response")
         return "No image generated"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
+        logger.info("Downloading generated image to %s", output_path)
         with urllib.request.urlopen(image_url, timeout=120) as resp:
-            output_path.write_bytes(resp.read())
+            data = resp.read()
+        output_path.write_bytes(data)
+        logger.info("Saved image to %s (%d bytes)", output_path, len(data))
     except Exception as e:
+        logger.exception("Failed to download generated image to %s: %s", output_path, e)
         return f"Error: failed to download generated image: {e}"
     return f"Image saved to {output_path}"
 
@@ -143,9 +199,11 @@ def generate_cover(prompt: str, slug: str) -> str:
         prompt: Detailed description of the image to generate.
         slug: Blog post slug. Image saves to blogs/<slug>/hero.png
     """
-    return _generate_image_with_qwen(
-        prompt, EXAMPLE_DIR / "blogs" / slug / "hero.png", COVER_IMAGE_SIZE
-    )
+    output = EXAMPLE_DIR / "blogs" / slug / "hero.png"
+    logger.debug("generate_cover invoked: slug=%s, output=%s", slug, output)
+    result = _generate_image_with_qwen(prompt, output, COVER_IMAGE_SIZE)
+    logger.debug("generate_cover result: %s", result)
+    return result
 
 
 @tool
@@ -157,9 +215,16 @@ def generate_social_image(prompt: str, platform: str, slug: str) -> str:
         platform: Either "linkedin" or "tweets"
         slug: Post slug. Image saves to <platform>/<slug>/image.png
     """
-    return _generate_image_with_qwen(
-        prompt, EXAMPLE_DIR / platform / slug / "image.png", SOCIAL_IMAGE_SIZE
+    output = EXAMPLE_DIR / platform / slug / "image.png"
+    logger.debug(
+        "generate_social_image invoked: platform=%s, slug=%s, output=%s",
+        platform,
+        slug,
+        output,
     )
+    result = _generate_image_with_qwen(prompt, output, SOCIAL_IMAGE_SIZE)
+    logger.debug("generate_social_image result: %s", result)
+    return result
 
 
 def load_subagents(config_path: Path) -> list:
@@ -175,6 +240,7 @@ def load_subagents(config_path: Path) -> list:
         "web_search": web_search,
     }
 
+    logger.info("Loading subagent definitions from %s", config_path)
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
@@ -190,20 +256,37 @@ def load_subagents(config_path: Path) -> list:
         if "tools" in spec:
             subagent["tools"] = [available_tools[t] for t in spec["tools"]]
         subagents.append(subagent)
+        logger.debug(
+            "Loaded subagent %r (model=%s, tools=%s)",
+            name,
+            subagent.get("model", "<inherited>"),
+            [getattr(t, "name", repr(t)) for t in subagent.get("tools", [])],
+        )
 
+    logger.info("Loaded %d subagents from %s", len(subagents), config_path)
     return subagents
 
 
 def create_content_writer():
     """Create a content writer agent configured by filesystem files."""
-    return create_deep_agent(
+    subagents = load_subagents(EXAMPLE_DIR / "subagents.yaml")
+    logger.info(
+        "Creating deep agent: model=deepseek-flash, memory=[AGENTS.md], "
+        "skills=[./skills/], tools=[generate_cover, generate_social_image], "
+        "subagents=%d, backend_root=%s",
+        len(subagents),
+        EXAMPLE_DIR,
+    )
+    agent = create_deep_agent(
         model = "deepseek-flash",
         memory=["./AGENTS.md"],           # Loaded by MemoryMiddleware
         skills=["./skills/"],             # Loaded by SkillsMiddleware
         tools=[generate_cover, generate_social_image],  # Image generation
-        subagents=load_subagents(EXAMPLE_DIR / "subagents.yaml"),  # Custom helper
+        subagents=subagents,  # Custom helper
         backend=FilesystemBackend(root_dir=EXAMPLE_DIR),
     )
+    logger.info("Deep agent created successfully")
+    return agent
 
 
 class AgentDisplay:
@@ -220,7 +303,10 @@ class AgentDisplay:
 
     def print_message(self, msg):
         """Print a message with nice formatting."""
+        kind = type(msg).__name__
+        logger.debug("print_message: kind=%s", kind)
         if isinstance(msg, HumanMessage):
+            logger.debug("HumanMessage content_len=%d", len(str(msg.content or "")))
             console.print(Panel(str(msg.content), title="You", border_style="blue"))
 
         elif isinstance(msg, AIMessage):
@@ -229,13 +315,23 @@ class AgentDisplay:
                 text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
                 content = "\n".join(text_parts)
 
+            logger.debug(
+                "AIMessage text_len=%d tool_calls=%d",
+                len(content or ""),
+                len(msg.tool_calls or []),
+            )
             if content and content.strip():
                 console.print(Panel(Markdown(content), title="Agent", border_style="green"))
 
             if msg.tool_calls:
+                logger.debug(
+                    "AIMessage tool_call names=%s",
+                    [tc.get("name") for tc in msg.tool_calls],
+                )
                 for tc in msg.tool_calls:
                     name = tc.get("name", "unknown")
                     args = tc.get("args", {})
+                    logger.debug("tool_call name=%r args_keys=%s", name, list(args.keys()))
 
                     if name == "task":
                         desc = args.get("description", "researching...")
@@ -254,17 +350,23 @@ class AgentDisplay:
 
         elif isinstance(msg, ToolMessage):
             name = getattr(msg, "name", "")
+            content_text = str(msg.content or "")
+            logger.debug(
+                "ToolMessage name=%r content_len=%d",
+                name,
+                len(content_text),
+            )
             if name in ("generate_cover", "generate_social_image"):
-                if "saved" in msg.content.lower():
+                if "saved" in content_text.lower():
                     console.print(f"  [green]✓ Image saved[/]")
                 else:
-                    console.print(f"  [red]✗ Image failed: {msg.content}[/]")
+                    console.print(f"  [red]✗ Image failed: {content_text}[/]")
             elif name == "write_file":
                 console.print(f"  [green]✓ File written[/]")
             elif name == "task":
                 console.print(f"  [green]✓ Research complete[/]")
             elif name == "web_search":
-                if "error" not in msg.content.lower():
+                if "error" not in content_text.lower():
                     console.print(f"  [green]✓ Found results[/]")
 
 
@@ -275,6 +377,7 @@ async def main():
     else:
         task = "Write a blog post about how AI agents are transforming software development"
 
+    logger.info("Starting content writer run with task=%r", task)
     console.print()
     console.print("[bold blue]Content Builder Agent[/]")
     console.print(f"[dim]Task: {task}[/]")
@@ -286,15 +389,29 @@ async def main():
     console.print()
 
     # Use Live display for spinner during waiting periods
+    logger.info("Streaming agent responses...")
     with Live(display.spinner, console=console, refresh_per_second=10, transient=True) as live:
+        chunk_count = 0
         async for chunk in agent.astream(
             {"messages": [("user", task)]},
             config={"configurable": {"thread_id": "content-writer-demo"}},
             stream_mode="values",
         ):
+            chunk_count += 1
+            logger.debug(
+                "astream chunk #%d received, keys=%s",
+                chunk_count,
+                sorted(chunk.keys()),
+            )
             if "messages" in chunk:
                 messages = chunk["messages"]
                 if len(messages) > display.printed_count:
+                    new_count = len(messages) - display.printed_count
+                    logger.debug(
+                        "Printing %d new message(s) (total so far: %d)",
+                        new_count,
+                        len(messages),
+                    )
                     # Temporarily stop spinner to print
                     live.stop()
                     for msg in messages[display.printed_count:]:
@@ -304,6 +421,11 @@ async def main():
                     live.start()
                     live.update(display.spinner)
 
+    logger.info(
+        "Agent stream finished; total chunks=%d, total messages=%d",
+        chunk_count,
+        display.printed_count,
+    )
     console.print()
     console.print("[bold green]✓ Done![/]")
 
@@ -312,4 +434,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        logger.warning("Run interrupted by user (KeyboardInterrupt)")
         console.print("\n[yellow]Interrupted[/]")
