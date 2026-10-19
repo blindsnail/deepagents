@@ -31,7 +31,6 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.spinner import Spinner
-from rich.text import Text
 
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
@@ -70,6 +69,72 @@ def web_search(
         return {"error": f"Search failed: {e}"}
 
 
+# Qwen-Image 3.0 text-to-image model served via DashScope's
+# MultiModalConversation (multimodal-generation) endpoint. It is a distinct
+# API from the legacy ImageSynthesis / wanx text-to-image path; the response
+# is read from output.choices[0].message.content[0]["image"].
+QWEN_IMAGE_MODEL = "qwen-image-3.0"
+# DashScope protocol uses width*height (with '*') — note this differs from
+# the OpenAI-compatible mode which uses 'x'. Both sizes are within the
+# model's 512x512..2048x2048 pixel-area range.
+# 16:9 landscape for blog hero images; gives negative space for title overlay,
+# as the blog-post skill recommends. ~0.9M pixels (well under the model's 2M cap).
+COVER_IMAGE_SIZE = "1280*720"
+# Square works across LinkedIn and Twitter/X feeds per the social-media skill.
+SOCIAL_IMAGE_SIZE = "1024*1024"
+
+
+def _generate_image_with_qwen(prompt: str, output_path: Path, size: str) -> str:
+    """Generate one image with the Qwen-Image 3.0 model via DashScope and save
+    it to `output_path`. Returns a status string for the @tool caller.
+    """
+    import urllib.request
+    from http import HTTPStatus
+
+    from dashscope import MultiModalConversation
+
+    if not os.environ.get("DASHSCOPE_API_KEY"):
+        return "Error: DASHSCOPE_API_KEY not set"
+
+    try:
+        rsp = MultiModalConversation.call(
+            model=QWEN_IMAGE_MODEL,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            result_format="message",
+            n=1,
+            size=size,
+        )
+    except Exception as e:
+        return f"Error: {e}"
+
+    if rsp.status_code != HTTPStatus.OK:
+        msg = (
+            f"Error: Qwen image generation failed "
+            f"(status={rsp.status_code}, code={rsp.code}, message={rsp.message})"
+        )
+        return msg
+
+    image_url: str | None = None
+    for choice in getattr(rsp.output, "choices", None) or []:
+        content = getattr(getattr(choice, "message", None), "content", None) or []
+        for part in content:
+            if isinstance(part, dict) and part.get("image"):
+                image_url = part["image"]
+                break
+        if image_url:
+            break
+    if not image_url:
+        return "No image generated"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(image_url, timeout=120) as resp:
+            output_path.write_bytes(resp.read())
+    except Exception as e:
+        return f"Error: failed to download generated image: {e}"
+    return f"Image saved to {output_path}"
+
+
 @tool
 def generate_cover(prompt: str, slug: str) -> str:
     """Generate a cover image for a blog post.
@@ -78,26 +143,9 @@ def generate_cover(prompt: str, slug: str) -> str:
         prompt: Detailed description of the image to generate.
         slug: Blog post slug. Image saves to blogs/<slug>/hero.png
     """
-    try:
-        from google import genai
-
-        client = genai.Client()
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-image",
-            contents=[prompt],
-        )
-
-        for part in response.parts:
-            if part.inline_data is not None:
-                image = part.as_image()
-                output_path = EXAMPLE_DIR / "blogs" / slug / "hero.png"
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                image.save(str(output_path))
-                return f"Image saved to {output_path}"
-
-        return "No image generated"
-    except Exception as e:
-        return f"Error: {e}"
+    return _generate_image_with_qwen(
+        prompt, EXAMPLE_DIR / "blogs" / slug / "hero.png", COVER_IMAGE_SIZE
+    )
 
 
 @tool
@@ -109,26 +157,9 @@ def generate_social_image(prompt: str, platform: str, slug: str) -> str:
         platform: Either "linkedin" or "tweets"
         slug: Post slug. Image saves to <platform>/<slug>/image.png
     """
-    try:
-        from google import genai
-
-        client = genai.Client()
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-image",
-            contents=[prompt],
-        )
-
-        for part in response.parts:
-            if part.inline_data is not None:
-                image = part.as_image()
-                output_path = EXAMPLE_DIR / platform / slug / "image.png"
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                image.save(str(output_path))
-                return f"Image saved to {output_path}"
-
-        return "No image generated"
-    except Exception as e:
-        return f"Error: {e}"
+    return _generate_image_with_qwen(
+        prompt, EXAMPLE_DIR / platform / slug / "image.png", SOCIAL_IMAGE_SIZE
+    )
 
 
 def load_subagents(config_path: Path) -> list:
